@@ -11,8 +11,11 @@ dependencies:
   camera: ^0.11.1
   hand_landmarker: ^2.0.0
   web_socket_channel: ^2.4.0
-  
-  # permission_handler: ^11.0.0
+  shared_preferences: ^2.2.0
+  package_info_plus: ^4.1.0
+  flutter_native_splash: ^2.3.1
+  # http: ^0.13.5
+  url_launcher: ^6.1.7
 
   # The example app's only runtime dependency is the plugin itself.
   # All other necessary packages (camera, jni, etc.) are brought in
@@ -21,8 +24,6 @@ dependencies:
 
   # UI packages like this are fine to keep as a direct dependency.
   cupertino_icons: ^1.0.8
-  shared_preferences: ^2.5.3
-  web_socket_channel: ^3.0.3
 
 dev_dependencies:
   integration_test:
