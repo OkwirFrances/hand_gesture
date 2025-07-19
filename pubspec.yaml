@@ -10,6 +10,7 @@ dependencies:
     sdk: flutter
   camera: ^0.11.1
   hand_landmarker: ^2.0.0
+  http: ^1.1.0
   
   # permission_handler: ^11.0.0
 
@@ -20,6 +21,8 @@ dependencies:
 
   # UI packages like this are fine to keep as a direct dependency.
   cupertino_icons: ^1.0.8
+  shared_preferences: ^2.5.3
+  web_socket_channel: ^3.0.3
 
 dev_dependencies:
   integration_test:

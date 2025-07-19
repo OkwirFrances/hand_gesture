@@ -1,333 +1,137 @@
 import 'dart:async';
-import 'dart:math' as math;
-import 'dart:io';
-import 'package:camera/camera.dart';
 import 'package:flutter/material.dart';
-import 'package:flutter/services.dart';
-// Import the plugin's main class.
+import 'package:camera/camera.dart';
 import 'package:hand_landmarker/hand_landmarker.dart';
+import 'package:web_socket_channel/web_socket_channel.dart';
 
-late List<CameraDescription> _cameras;
+late List<CameraDescription> cameras;
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
-  await SystemChrome.setPreferredOrientations([DeviceOrientation.portraitUp]);
-  _cameras = await availableCameras();
-  runApp(const MyApp());
+  cameras = await availableCameras();
+  runApp(const MaterialApp(home: SlideRemote()));
 }
 
-class MyApp extends StatelessWidget {
-  const MyApp({super.key});
-
+class SlideRemote extends StatefulWidget {
+  const SlideRemote({super.key});
   @override
-  Widget build(BuildContext context) {
-    return const MaterialApp(
-      title: 'Hand Landmarker Example',
-      home: HandTrackerView(),
-    );
-  }
+  State<SlideRemote> createState() => _SlideRemoteState();
 }
 
-class HandTrackerView extends StatefulWidget {
-  const HandTrackerView({super.key});
-
-  @override
-  State<HandTrackerView> createState() => _HandTrackerViewState();
-}
-
-class _HandTrackerViewState extends State<HandTrackerView> {
-  CameraController? _controller;
-  // The plugin instance that will handle all the heavy lifting.
+class _SlideRemoteState extends State<SlideRemote> {
+  CameraController? _cam;
   HandLandmarkerPlugin? _plugin;
-  // The results from the plugin will be stored in this list.
-  List<Hand> _landmarks = [];
-  // A flag to show a loading indicator while the camera and plugin are initializing.
-  bool _isInitialized = false;
-  // A guard to prevent processing multiple frames at once.
+  WebSocketChannel? _ws;
+  Timer? _reconnectTimer;
+
   bool _isDetecting = false;
-  int _frameCount = 0;
+  String _status = 'Connecting…';
 
-  // WebSocket connection to PC
-  WebSocket? _socket;
-  String _lastAction = 'None';
-
-  // PC connection settings
-  final String _pcIP = '192.168.43.6';
-  final int _pcPort = 8080;
-
+  // ---------- INIT ----------
   @override
   void initState() {
     super.initState();
-    _initialize();
-    _connectWebSocket();
+    _initCamera();
+    _connectWS();
   }
 
-  Future<void> _initialize() async {
-    final camera = _cameras.firstWhere(
-      (cam) => cam.lensDirection == CameraLensDirection.front,
-      orElse: () => _cameras.first,
+  Future<void> _initCamera() async {
+    final cam = cameras.firstWhere(
+      (c) => c.lensDirection == CameraLensDirection.front,
+      orElse: () => cameras.first,
     );
-    _controller = CameraController(
-      camera,
-      ResolutionPreset.low, // Lower resolution for faster processing
-      enableAudio: false,
-    );
+    _cam = CameraController(cam, ResolutionPreset.medium, enableAudio: false);
+    await _cam!.initialize();
+
+    // correct constructor (positional args)
     _plugin = HandLandmarkerPlugin.create();
-    await _controller!.initialize();
-    await _controller!.startImageStream(_processCameraImage);
-    if (mounted) {
-      setState(() {
-        _isInitialized = true;
-      });
-    }
+
+    _cam!.startImageStream(_onFrame);
+    if (mounted) setState(() {});
   }
 
-  Future<void> _connectWebSocket() async {
+  // ---------- WebSocket ----------
+  void _connectWS() {
+    _ws?.sink.close();
     try {
-      _socket?.close();
-      _socket = await WebSocket.connect('ws://$_pcIP:$_pcPort/ws');
-      _socket!.listen((message) {
-        debugPrint('Received from server: $message');
-      }, onDone: () async {
-        setState(() {
-          _socket = null;
-        });
-        await Future.delayed(const Duration(seconds: 2));
-        if (mounted) await _connectWebSocket();
-      }, onError: (e) async {
-        debugPrint('WebSocket error: $e');
-        setState(() {
-          _socket = null;
-        });
-        await Future.delayed(const Duration(seconds: 2));
-        if (mounted) await _connectWebSocket();
+      _ws = WebSocketChannel.connect(Uri.parse('ws://192.168.43.6:8080'));
+      _ws!.ready.then((_) {
+        if (mounted) setState(() => _status = 'Ready');
+      }).onError((_, __) {
+        _scheduleReconnect();
+        return null;
       });
-      setState(() {});
-    } catch (e) {
-      debugPrint('WebSocket connection failed: $e');
-      setState(() {
-        _socket = null;
-      });
-      await Future.delayed(const Duration(seconds: 2));
-      if (mounted) await _connectWebSocket();
+
+      _ws!.stream.listen(
+        (_) {},
+        onDone: _scheduleReconnect,
+        onError: (_) => _scheduleReconnect(),
+      );
+    } catch (_) {
+      _scheduleReconnect();
     }
   }
 
-  @override
-  void dispose() {
-    // Stop the image stream and dispose of the controller.
-    _controller?.stopImageStream();
-    _controller?.dispose();
-    // Dispose of the plugin to release native resources.
-    _plugin?.dispose();
-    _socket?.close();
-    super.dispose();
+  void _scheduleReconnect() {
+    if (mounted) setState(() => _status = 'Reconnecting…');
+    _reconnectTimer?.cancel();
+    _reconnectTimer = Timer(const Duration(seconds: 2), _connectWS);
   }
 
-  Future<void> _processCameraImage(CameraImage image) async {
-    _frameCount++;
-    if (_frameCount % 2 != 0) return; // Only process every 2nd frame for speed
-    if (_isDetecting || !_isInitialized || _plugin == null) return;
-
+  // ---------- FRAME ----------
+  Future<void> _onFrame(CameraImage frame) async {
+    if (_isDetecting || _plugin == null || _cam == null) return;
     _isDetecting = true;
 
     try {
-      // The detect method is now synchronous (not async).
-      final hands = _plugin!.detect(
-        image,
-        _controller!.description.sensorOrientation,
-      );
-      if (mounted) {
-        setState(() {
-          _landmarks = hands;
-        });
-        if (hands.isNotEmpty) {
-          _detectGesture(hands.first);
+      final hands = _plugin!.detect(frame, _cam!.description.sensorOrientation);
+      if (hands.isNotEmpty) {
+        final lm = hands.first.landmarks;
+        final thumbTip = lm[4], indexTip = lm[8], middleTip = lm[12];
+
+        String? cmd;
+        final pinch = (thumbTip.x - indexTip.x).abs() +
+                      (thumbTip.y - indexTip.y).abs();
+        if (pinch < 0.07) {
+          cmd = 'next';
+        } else if (middleTip.y < indexTip.y - 0.05) {
+          cmd = 'prev';
+        } else if (indexTip.y < 0.35 && middleTip.y < 0.35) {
+          cmd = 'play';
+        }
+
+        if (cmd != null) {
+          _ws?.sink.add(cmd);
+          setState(() => _status = cmd ?? '');
+          await Future.delayed(const Duration(milliseconds: 350));
         }
       }
-    } catch (e) {
-      debugPrint('Error detecting landmarks: $e');
-    } finally {
-      // Allow the next frame to be processed.
-      _isDetecting = false;
-    }
+    } catch (_) {}
+    _isDetecting = false;
   }
 
-  void _detectGesture(Hand hand) {
-    if (hand.landmarks.length < 21) return;
-    String gesture = _classifyGesture(hand.landmarks);
-    if (gesture != 'None') {
-      _sendCommandWebSocket(gesture);
-      setState(() {
-        _lastAction = gesture;
-      });
-    }
-  }
-
-  String _classifyGesture(List<Landmark> landmarks) {
-    final thumbTip = landmarks[4];
-    final thumbIP = landmarks[3];
-    final indexTip = landmarks[8];
-    final indexPIP = landmarks[6];
-    final middleTip = landmarks[12];
-    final middlePIP = landmarks[10];
-    final ringTip = landmarks[16];
-    final ringPIP = landmarks[14];
-    final pinkyTip = landmarks[20];
-    final pinkyPIP = landmarks[18];
-    final wrist = landmarks[0];
-    bool thumbUp = thumbTip.y < thumbIP.y && thumbTip.y < wrist.y;
-    bool indexUp = indexTip.y < indexPIP.y;
-    bool middleUp = middleTip.y < middlePIP.y;
-    bool ringUp = ringTip.y < ringPIP.y;
-    bool pinkyUp = pinkyTip.y < pinkyPIP.y;
-    int extendedFingers = 0;
-    if (thumbUp) extendedFingers++;
-    if (indexUp) extendedFingers++;
-    if (middleUp) extendedFingers++;
-    if (ringUp) extendedFingers++;
-    if (pinkyUp) extendedFingers++;
-    if (thumbUp && !indexUp && !middleUp && !ringUp && !pinkyUp) {
-      return 'START';
-    } else if (extendedFingers == 0) {
-      return 'END';
-    } else if (!thumbUp && indexUp && !middleUp && !ringUp && !pinkyUp) {
-      return 'NEXT';
-    } else if (!thumbUp && indexUp && middleUp && !ringUp && !pinkyUp) {
-      return 'PREV';
-    } else if (extendedFingers == 5) {
-      return 'PAUSE';
-    }
-    return 'None';
-  }
-
-  void _sendCommandWebSocket(String command) {
-    if (_socket == null || _socket!.readyState != WebSocket.open) return;
-    _socket!.add(command);
-    debugPrint('WebSocket sent: $command');
-  }
-
+  // ---------- UI ----------
   @override
   Widget build(BuildContext context) {
-    // Show a loading indicator while initializing.
-    if (!_isInitialized) {
-      return const Center(child: CircularProgressIndicator());
+    if (_cam == null || !_cam!.value.isInitialized) {
+      return const Scaffold(body: Center(child: CircularProgressIndicator()));
     }
-
-    final controller = _controller!;
-    final previewSize = controller.value.previewSize!;
-    final previewAspectRatio = previewSize.height / previewSize.width;
-
     return Scaffold(
-      appBar: AppBar(title: const Text('Live Hand Tracking')),
-      body: Center(
-        child: Column(
-          mainAxisAlignment: MainAxisAlignment.center,
-          children: [
-            AspectRatio(
-              aspectRatio: previewAspectRatio,
-              child: Stack(
-                children: [
-                  CameraPreview(controller),
-                  CustomPaint(
-                    // Tell the painter to fill the available space
-                    size: Size.infinite,
-                    painter: LandmarkPainter(
-                      hands: _landmarks,
-                      // Pass the camera's resolution explicitly
-                      previewSize: previewSize,
-                      lensDirection: controller.description.lensDirection,
-                      sensorOrientation:
-                          controller.description.sensorOrientation,
-                    ),
-                  ),
-                ],
-              ),
-            ),
-            const SizedBox(height: 16),
-            Text(
-              'Last Action: $_lastAction',
-              style: const TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
-            ),
-          ],
-        ),
+      appBar: AppBar(title: Text('Slide Remote – $_status')),
+      body: AspectRatio(
+        aspectRatio: _cam!.value.aspectRatio,
+        child: CameraPreview(_cam!),
       ),
     );
   }
-}
 
-/// A custom painter that renders the hand landmarks and connections.
-class LandmarkPainter extends CustomPainter {
-  LandmarkPainter({
-    required this.hands,
-    required this.previewSize,
-    required this.lensDirection,
-    required this.sensorOrientation,
-  });
-
-  final List<Hand> hands;
-  final Size previewSize;
-  final CameraLensDirection lensDirection;
-  final int sensorOrientation;
-
+  // ---------- CLEANUP ----------
   @override
-  void paint(Canvas canvas, Size size) {
-    final scale = size.width / previewSize.height;
-    final paint = Paint()
-      ..color = Colors.red
-      ..strokeWidth = 8 / scale
-      ..strokeCap = StrokeCap.round;
-    final linePaint = Paint()
-      ..color = Colors.lightBlueAccent
-      ..strokeWidth = 4 / scale;
-    canvas.save();
-    final center = Offset(size.width / 2, size.height / 2);
-    canvas.translate(center.dx, center.dy);
-    canvas.rotate(sensorOrientation * math.pi / 180);
-    if (lensDirection == CameraLensDirection.front) {
-      canvas.scale(-1, 1);
-      canvas.rotate(math.pi);
-    }
-    canvas.scale(scale);
-    final logicalWidth = previewSize.width;
-    final logicalHeight = previewSize.height;
-    for (final hand in hands) {
-      for (final landmark in hand.landmarks) {
-        final dx = (landmark.x - 0.5) * logicalWidth;
-        final dy = (landmark.y - 0.5) * logicalHeight;
-        canvas.drawCircle(Offset(dx, dy), 8 / scale, paint);
-      }
-      for (final connection in HandLandmarkConnections.connections) {
-        if (connection[0] < hand.landmarks.length &&
-            connection[1] < hand.landmarks.length) {
-          final start = hand.landmarks[connection[0]];
-          final end = hand.landmarks[connection[1]];
-          final startDx = (start.x - 0.5) * logicalWidth;
-          final startDy = (start.y - 0.5) * logicalHeight;
-          final endDx = (end.x - 0.5) * logicalWidth;
-          final endDy = (end.y - 0.5) * logicalHeight;
-          canvas.drawLine(
-            Offset(startDx, startDy),
-            Offset(endDx, endDy),
-            linePaint,
-          );
-        }
-      }
-    }
-    canvas.restore();
+  void dispose() {
+    _cam?.dispose();
+    _plugin?.dispose();
+    _reconnectTimer?.cancel();
+    _ws?.sink.close();
+    super.dispose();
   }
-
-  @override
-  bool shouldRepaint(covariant CustomPainter oldDelegate) => true;
-}
-
-/// Helper class.
-class HandLandmarkConnections {
-  static const List<List<int>> connections = [
-    [0, 1], [1, 2], [2, 3], [3, 4], // Thumb
-    [0, 5], [5, 6], [6, 7], [7, 8], // Index finger
-    [5, 9], [9, 10], [10, 11], [11, 12], // Middle finger
-    [9, 13], [13, 14], [14, 15], [15, 16], // Ring finger
-    [13, 17], [0, 17], [17, 18], [18, 19], [19, 20], // Pinky
-  ];
 }
